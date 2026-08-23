@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Blind Guide</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 16px;
+    font-family: -apple-system, system-ui, sans-serif;
+    background: #111; color: #eee;
+    display: flex; flex-direction: column; gap: 14px;
+    min-height: 100vh; box-sizing: border-box;
+  }
+  h1 { font-size: 18px; margin: 0; text-align: center; }
+  .row { display: flex; gap: 8px; }
+  input {
+    flex: 1; padding: 10px; border-radius: 8px; border: 1px solid #444;
+    background: #1c1c1c; color: #eee; font-size: 16px;
+  }
+  button {
+    padding: 10px 14px; border-radius: 8px; border: none;
+    font-size: 15px; font-weight: 600; cursor: pointer;
+  }
+  #connectBtn { background: #2d6cdf; color: white; }
+  #video { width: 100%; max-height: 30vh; border-radius: 10px; background: #000; object-fit: cover; }
+  .status { display: flex; gap: 10px; justify-content: center; font-size: 13px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 4px; background: #555; }
+  .dot.on { background: #3ecf5b; }
+  #toggleBtn {
+    background: #333; color: #eee; padding: 14px; font-size: 16px; border-radius: 10px;
+  }
+  #toggleBtn.active { background: #3ecf5b; color: #111; }
+  #talkBtn {
+    background: #d43d3d; color: white; padding: 26px; font-size: 18px;
+    border-radius: 16px; user-select: none; -webkit-user-select: none;
+    touch-action: none;
+  }
+  #talkBtn.recording { background: #ff6b6b; transform: scale(0.98); }
+  #log {
+    flex: 1; background: #0a0a0a; border-radius: 8px; padding: 8px;
+    font-family: monospace; font-size: 12px; overflow-y: auto;
+    max-height: 22vh; white-space: pre-wrap; line-height: 1.4;
+  }
+</style>
+</head>
+<body>
+
+<h1>new Blind Guide</h1>
+
+<div class="row">
+  <input id="hostInput" placeholder="server host or ip:port, e.g. 192.168.1.20:8000">
+  <button id="connectBtn">Connect</button>
+</div>
+
+<div class="status">
+  <span><span id="dotVideo" class="dot"></span>video</span>
+  <span><span id="dotAudio" class="dot"></span>audio</span>
+  <span><span id="dotControl" class="dot"></span>control</span>
+</div>
+
+<video id="video" autoplay playsinline muted></video>
+<canvas id="canvas" style="display:none;"></canvas>
+
+<button id="toggleBtn" class="active">Detection: ON</button>
+
+<button id="talkBtn">Hold to Ask</button>
+
+<div id="log"></div>
+
+<script>
+const els = {
+  host: document.getElementById('hostInput'),
+  connect: document.getElementById('connectBtn'),
+  video: document.getElementById('video'),
+  canvas: document.getElementById('canvas'),
+  toggle: document.getElementById('toggleBtn'),
+  talk: document.getElementById('talkBtn'),
+  log: document.getElementById('log'),
+  dotVideo: document.getElementById('dotVideo'),
+  dotAudio: document.getElementById('dotAudio'),
+  dotControl: document.getElementById('dotControl'),
+};
+
+function log(msg) {
+  const line = document.createElement('div');
+  line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  els.log.appendChild(line);
+  els.log.scrollTop = els.log.scrollHeight;
+}
+
+let videoWs = null, audioWs = null, controlWs = null;
+let detectionOn = true;
+let frameInterval = null;
+let reconnectTimers = {};
+let isManualDisconnect = false;
+
+// ---------------------------------------------------------------------
+// Helper: Connection & Auto-reconnect Manager
+// ---------------------------------------------------------------------
+
+function createManagedSocket(name, url, options = {}) {
+  const ws = new WebSocket(url);
+  if (options.binaryType) ws.binaryType = options.binaryType;
+
+  ws.onopen = () => {
+    if (els[`dot${name}`]) els[`dot${name}`].classList.add('on');
+    log(`${name.toLowerCase()} connected`);
+    if (reconnectTimers[name]) clearTimeout(reconnectTimers[name]);
+    if (options.onopen) options.onopen(ws);
+  };
+
+  ws.onmessage = options.onmessage || null;
+
+  ws.onclose = () => {
+    if (els[`dot${name}`]) els[`dot${name}`].classList.remove('on');
+    log(`${name.toLowerCase()} disconnected`);
+    if (options.onclose) options.onclose();
+
+    if (!isManualDisconnect) {
+      log(`reconnecting ${name.toLowerCase()} in 2s...`);
+      reconnectTimers[name] = setTimeout(() => {
+        const host = els.host.value.trim();
+        if (host) {
+          if (name === 'Video') connectVideo(host);
+          if (name === 'Audio') connectAudio(host);
+          if (name === 'Control') connectControl(host);
+        }
+      }, 2000);
+    }
+  };
+
+  ws.onerror = () => log(`${name.toLowerCase()} socket error`);
+  return ws;
+}
+
+// ---------------------------------------------------------------------
+// Connect Trigger
+// ---------------------------------------------------------------------
+
+els.connect.addEventListener('click', async () => {
+  const host = els.host.value.trim();
+  if (!host) { log('enter a host first'); return; }
+  
+  // Basic security context diagnostic
+  if (!window.isSecureContext && !host.includes('localhost') && !host.includes('127.0.0.1')) {
+    log('WARNING: Camera/Mic require HTTPS or Chrome flag enabled for remote IPs.');
+  }
+
+  localStorage.setItem('bg_host', host);
+  isManualDisconnect = false;
+
+  await connectVideo(host);
+  await connectAudio(host);
+  await connectControl(host);
+});
+
+// restore last-used host
+const savedHost = localStorage.getItem('bg_host');
+if (savedHost) els.host.value = savedHost;
+
+// ---------------------------------------------------------------------
+// Video: camera -> /ws/video
+// ---------------------------------------------------------------------
+
+async function connectVideo(host) {
+  if (!els.video.srcObject) {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment', width: 640, height: 480 },
+        audio: false,
+      });
+      els.video.srcObject = stream;
+    } catch (e) {
+      log('camera error: ' + e.message);
+      return;
+    }
+  }
+
+  videoWs = createManagedSocket('Video', `ws://${host}/ws/video`, {
+    binaryType: 'arraybuffer',
+    onopen: () => startFrameLoop(),
+    onclose: () => stopFrameLoop()
+  });
+}
+
+function startFrameLoop() {
+  if (frameInterval) clearInterval(frameInterval);
+  const ctx = els.canvas.getContext('2d');
+  frameInterval = setInterval(() => {
+    if (!videoWs || videoWs.readyState !== WebSocket.OPEN) return;
+    if (els.video.videoWidth === 0) return;
+
+    els.canvas.width = els.video.videoWidth;
+    els.canvas.height = els.video.videoHeight;
+    ctx.drawImage(els.video, 0, 0);
+
+    els.canvas.toBlob((blob) => {
+      if (blob && videoWs && videoWs.readyState === WebSocket.OPEN) {
+        blob.arrayBuffer().then((buf) => {
+          if (videoWs.readyState === WebSocket.OPEN) videoWs.send(buf);
+        });
+      }
+    }, 'image/jpeg', 0.7);
+  }, 100); // 10 fps
+}
+
+function stopFrameLoop() {
+  if (frameInterval) clearInterval(frameInterval);
+  frameInterval = null;
+}
+
+// ---------------------------------------------------------------------
+// Audio out: /ws/audio -> speaker (raw PCM16 mono @ 24kHz from server)
+// ---------------------------------------------------------------------
+
+let outCtx = null;
+let nextStartTime = 0;
+const OUT_SAMPLE_RATE = 24000;
+
+async function connectAudio(host) {
+  if (!outCtx || outCtx.state === 'closed') {
+    outCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+
+  audioWs = createManagedSocket('Audio', `ws://${host}/ws/audio`, {
+    binaryType: 'arraybuffer',
+    onopen: () => { nextStartTime = 0; },
+    onmessage: (event) => {
+      if (!(event.data instanceof ArrayBuffer)) return;
+      playPCM16Chunk(event.data);
+    }
+  });
+}
+
+function playPCM16Chunk(arrayBuffer) {
+  if (!outCtx || outCtx.state === 'closed') return;
+
+  // Resume suspended AudioContext (iOS / Safari power-saving behavior)
+  if (outCtx.state === 'suspended') {
+    outCtx.resume();
+  }
+
+  const int16 = new Int16Array(arrayBuffer);
+  const float32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
+
+  const audioBuffer = outCtx.createBuffer(1, float32.length, OUT_SAMPLE_RATE);
+  audioBuffer.copyToChannel(float32, 0);
+
+  const src = outCtx.createBufferSource();
+  src.buffer = audioBuffer;
+  src.connect(outCtx.destination);
+
+  // Clean up AudioNode to release mobile WebAudio resources on finish
+  src.onended = () => {
+    src.disconnect();
+  };
+
+  const now = outCtx.currentTime;
+  if (nextStartTime < now) nextStartTime = now;
+  src.start(nextStartTime);
+  nextStartTime += audioBuffer.duration;
+}
+
+// ---------------------------------------------------------------------
+// Control: toggle detection + push-to-talk -> /ws/control
+// ---------------------------------------------------------------------
+
+async function connectControl(host) {
+  controlWs = createManagedSocket('Control', `ws://${host}/ws/control`);
+}
+
+els.toggle.addEventListener('click', () => {
+  detectionOn = !detectionOn;
+  els.toggle.textContent = `Detection: ${detectionOn ? 'ON' : 'OFF'}`;
+  els.toggle.classList.toggle('active', detectionOn);
+  if (controlWs && controlWs.readyState === WebSocket.OPEN) {
+    controlWs.send(JSON.stringify({ cmd: 'toggle_detection', value: detectionOn }));
+  }
+});
+
+// --- push-to-talk mic capture, downsampled + int16-encoded for /ws/control ---
+
+const MIC_SAMPLE_RATE = 16000;
+let micCtx = null, micSource = null, micProcessor = null, micSilentGain = null;
+let recording = false;
+let recordedChunks = [];
+
+async function startRecording() {
+  if (!controlWs || controlWs.readyState !== WebSocket.OPEN) { log('control not connected'); return; }
+
+  controlWs.send(JSON.stringify({ cmd: 'interrupt' }));
+
+  try {
+    const micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    micCtx = new (window.AudioContext || window.webkitAudioContext)();
+    micSource = micCtx.createMediaStreamSource(micStream);
+
+    micProcessor = micCtx.createScriptProcessor(4096, 1, 1);
+    recordedChunks = [];
+
+    micProcessor.onaudioprocess = (e) => {
+      if (recording) recordedChunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+    };
+
+    micSilentGain = micCtx.createGain();
+    micSilentGain.gain.value = 0;
+    micSource.connect(micProcessor);
+    micProcessor.connect(micSilentGain);
+    micSilentGain.connect(micCtx.destination);
+
+    recording = true;
+    els.talk.classList.add('recording');
+    els.talk.textContent = 'Listening...';
+    log('recording...');
+  } catch (e) {
+    log('mic error: ' + e.message);
+  }
+}
+
+function downsample(float32, inputRate, outputRate) {
+  if (outputRate === inputRate) return float32;
+  const ratio = inputRate / outputRate;
+  const newLength = Math.round(float32.length / ratio);
+  const result = new Float32Array(newLength);
+  let offsetResult = 0, offsetBuffer = 0;
+  while (offsetResult < newLength) {
+    const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+    let accum = 0, count = 0;
+    for (let i = offsetBuffer; i < nextOffsetBuffer && i < float32.length; i++) { accum += float32[i]; count++; }
+    result[offsetResult] = count ? accum / count : 0;
+    offsetResult++;
+    offsetBuffer = nextOffsetBuffer;
+  }
+  return result;
+}
+
+function floatTo16BitPCM(float32) {
+  const buffer = new ArrayBuffer(float32.length * 2);
+  const view = new DataView(buffer);
+  for (let i = 0, offset = 0; i < float32.length; i++, offset += 2) {
+    const s = Math.max(-1, Math.min(1, float32[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+  return buffer;
+}
+
+function stopRecording() {
+  if (!recording) return;
+  recording = false;
+  els.talk.classList.remove('recording');
+  els.talk.textContent = 'Hold to Ask';
+
+  if (micProcessor) micProcessor.disconnect();
+  if (micSource) micSource.disconnect();
+  if (micSilentGain) micSilentGain.disconnect();
+  
+  const inputRate = micCtx ? micCtx.sampleRate : 44100;
+  if (micCtx && micCtx.state !== 'closed') micCtx.close();
+
+  if (recordedChunks.length === 0) { log('nothing recorded'); return; }
+
+  const totalLength = recordedChunks.reduce((sum, c) => sum + c.length, 0);
+  const merged = new Float32Array(totalLength);
+  let offset = 0;
+  for (const chunk of recordedChunks) { merged.set(chunk, offset); offset += chunk.length; }
+  recordedChunks = [];
+
+  const resampled = downsample(merged, inputRate, MIC_SAMPLE_RATE);
+  const pcm16 = floatTo16BitPCM(resampled);
+
+  if (controlWs && controlWs.readyState === WebSocket.OPEN) {
+    controlWs.send(JSON.stringify({ cmd: 'assistant_audio_query' }));
+    controlWs.send(pcm16);
+    log('sent question, waiting for answer...');
+  }
+}
+
+// touch + mouse triggers
+els.talk.addEventListener('touchstart', (e) => { e.preventDefault(); startRecording(); });
+els.talk.addEventListener('touchend', (e) => { e.preventDefault(); stopRecording(); });
+els.talk.addEventListener('mousedown', startRecording);
+els.talk.addEventListener('mouseup', stopRecording);
+
+// Clean unload handling to prevent dangling server connections
+window.addEventListener('beforeunload', () => {
+  isManualDisconnect = true;
+  if (videoWs) videoWs.close();
+  if (audioWs) audioWs.close();
+  if (controlWs) controlWs.close();
+});
+</script>
+</body>
+</html>
