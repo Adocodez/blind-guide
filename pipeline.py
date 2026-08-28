@@ -1,15 +1,11 @@
 """
-pipeline.py
-
-Detection + tracking + alert logic, extracted from the original single-file
-script. Has no camera, TTS, or UI code in it — it just takes frames in and
-gives back a list of announcement dicts. This makes it reusable from a server,
-a local test script, or (later) fed by a different frame source entirely.
+Detection + tracking + alert logic with bounding box rendering.
 """
 
 import time
 from dataclasses import dataclass, field
 
+import cv2
 import numpy as np
 from ultralytics import YOLOWorld
 
@@ -59,14 +55,12 @@ def position_bucket(x_center: float, frame_width: int) -> str:
 
 
 def pluralize(label: str) -> str:
-    """Very small heuristic pluralizer, good enough for our fixed CLASSES list."""
     if label.endswith(("s", "sh", "ch", "x", "z")):
         return label + "es"
     return label + "s"
 
 
 def phrase(label: str, distance: str, position: str, count: int = 1) -> str:
-    """Builds an announcement phrase, grouping same-class objects when count > 1."""
     if count > 1:
         label_text = pluralize(label)
         if distance == "very close":
@@ -79,11 +73,6 @@ def phrase(label: str, distance: str, position: str, count: int = 1) -> str:
 
 
 def group_announcements(events: list[dict]) -> list[dict]:
-    """
-    Groups per-track announcement events sharing (label, distance, position)
-    into one combined announcement with a count, so e.g. three chairs at the
-    same distance/position produce one utterance instead of three.
-    """
     groups: dict[tuple, dict] = {}
     for ev in events:
         key = (ev["label"], ev["distance"], ev["position"])
@@ -167,15 +156,6 @@ class AlertMemory:
 # ----------------------------------------------------------------------
 
 class DetectionPipeline:
-    """
-    Wraps the YOLO-World model + AlertMemory. Call process_frame(frame) with a
-    BGR numpy array (e.g. from cv2.imdecode) and get back a list of ready-to-speak
-    announcement dicts: {"text": str, "urgent": bool}.
-
-    This class does blocking, synchronous work (model inference) — callers on an
-    asyncio event loop should run it in a thread pool executor.
-    """
-
     def __init__(self, weights: str = "yolov8s-world.pt", tracker_config: str = "custom_bytetrack.yaml", device=0):
         self.model = YOLOWorld(weights)
         self.model.set_classes(CLASSES)
@@ -183,8 +163,13 @@ class DetectionPipeline:
         self.device = device
         self.memory = AlertMemory()
 
-    def process_frame(self, frame: np.ndarray) -> list[dict]:
+    def process_frame(self, frame: np.ndarray) -> tuple[list[dict], np.ndarray]:
+        """
+        Runs YOLO tracking, evaluates announcements, and draws bounding boxes on the frame.
+        Returns: (announcements, annotated_frame)
+        """
         frame_h, frame_w = frame.shape[:2]
+        annotated_frame = frame.copy()
 
         results = self.model.track(
             frame,
@@ -207,6 +192,7 @@ class DetectionPipeline:
                 track_id = int(box.id[0])
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 cls_id = int(box.cls[0])
+                conf = float(box.conf[0])
                 label = self.model.names[cls_id]
 
                 active_ids.add(track_id)
@@ -229,6 +215,26 @@ class DetectionPipeline:
                         "urgent": urgent,
                     })
 
+                # --- Draw Bounding Boxes on annotated_frame ---
+                box_color = (0, 0, 255) if urgent or distance == "very close" else (0, 255, 0)
+                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), box_color, 2)
+
+                text_str = f"#{track_id} {label} ({distance}) {conf:.2f}"
+                (tw, th), _ = cv2.getTextSize(text_str, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                
+                # Draw background rectangle for text
+                cv2.rectangle(annotated_frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), box_color, -1)
+                cv2.putText(
+                    annotated_frame,
+                    text_str,
+                    (x1 + 2, y1 - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+
         self.memory.forget_stale(active_ids, max_age=30.0)
 
         announcements = []
@@ -236,4 +242,4 @@ class DetectionPipeline:
             text = phrase(group["label"], group["distance"], group["position"], count=group["count"])
             announcements.append({"text": text, "urgent": group["urgent"]})
 
-        return announcements
+        return announcements, annotated_frame

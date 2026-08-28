@@ -61,6 +61,7 @@ class OllamaVisionAssistant:
         try:
             response = self.client.chat(model=self.model, messages=messages, stream=False,think=False)
             content = response["message"]["content"].strip()
+            print(f"[ollama_vlm] Model response: {content}")
             return content or "I'm not sure how to answer that."
         except Exception as e:
             logger.error("Ollama request failed: %s", e)

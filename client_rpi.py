@@ -1,52 +1,50 @@
 """
-client_test.py
+client_test.py - Raspberry Pi 3B Client (Bookworm 12 32-bit)
 
-Stand-in for the eventual phone/earpiece client. Pure I/O — all the AI
-(detection, STT, the vision-language model) lives on the server. The server
-is found via mDNS instead of a hardcoded IP.
-
-Hotkeys:
-  F8         toggle image-recognition detection on/off
-  hold F9    push-to-talk: interrupts current speech, records raw mic audio,
-             sends it to the server on release. Server transcribes with
-             Whisper, asks Ollama, and speaks the answer back over /ws/audio.
+Handles I/O on Raspberry Pi 3B:
+- Video: RPi Camera v1.3 captured via Picamera2
+- Audio IN: USB Microphone via sounddevice
+- Audio OUT: 3.5mm AUX Speaker via sounddevice
+- Control: Physical GPIO Pushbuttons via gpiozero
 """
 
 import asyncio
 import json
 import socket
-
 import cv2
 import numpy as np
 import sounddevice as sd
 import websockets
-from pynput import keyboard
+from gpiozero import Button
+from picamera2 import Picamera2
 from zeroconf import Zeroconf
 
 # ----------------------------------------------------------------------
-# Configuration & Manual Overrides
+# Configuration & Hardware Settings
 # ----------------------------------------------------------------------
-# Leave MANUAL_HOST = None to auto-discover via mDNS.
-# Set to an IP address string (e.g., "192.168.1.20") to bypass mDNS.
 MANUAL_HOST: str | None = None
 MANUAL_PORT: int = 8000
 
-# Audio & Frame settings
-SAMPLE_RATE = 24000      # Audio OUT from server (must match audio_engine.SAMPLE_RATE)
-MIC_SAMPLE_RATE = 16000  # Audio IN to server (must match stt.SAMPLE_RATE)
-CHANNELS = 1
-FRAME_SEND_HZ = 10       # Frame rate cap to save bandwidth/CPU
+# GPIO Pin Mapping (BCM Numbering)
+PIN_TOGGLE_DETECTION = 17  # Button to toggle detection on/off
+PIN_PTT = 27               # Button to hold for Push-To-Talk
 
-# mDNS Service Specs (must match server.py / discovery.py)
+# Sound Device Index Settings (Set to None for system default, or integer index)
+AUDIO_INPUT_DEVICE = None   # USB Microphone
+AUDIO_OUTPUT_DEVICE = "plughw:3,0"  # 3.5mm AUX Jack
+
+SAMPLE_RATE = 24000      # Audio OUT from server (matches audio_engine.SAMPLE_RATE)
+MIC_SAMPLE_RATE = 48000  # Audio IN to server (matches stt.SAMPLE_RATE)
+CHANNELS = 1
+FRAME_SEND_HZ = 10       # Frame rate cap
+
 SERVICE_TYPE = "_blindguide._tcp.local."
 SERVICE_NAME = "blindguide." + SERVICE_TYPE
 
-# Shared Zeroconf instance
 zc = Zeroconf()
 
 
 def resolve_server(zc_inst: Zeroconf, timeout_s: float = 5.0) -> tuple[str, int] | None:
-    """Queries the network for the blindguide service and returns (ip, port)."""
     info = zc_inst.get_service_info(SERVICE_TYPE, SERVICE_NAME, timeout=int(timeout_s * 1000))
     if info is None or not info.addresses:
         return None
@@ -55,7 +53,6 @@ def resolve_server(zc_inst: Zeroconf, timeout_s: float = 5.0) -> tuple[str, int]
 
 
 async def get_server_uri(path: str) -> str | None:
-    """Resolves server URI via direct override or mDNS discovery."""
     if MANUAL_HOST:
         return f"ws://{MANUAL_HOST}:{MANUAL_PORT}{path}"
 
@@ -68,46 +65,52 @@ async def get_server_uri(path: str) -> str | None:
 
 
 async def send_video():
-    """Captures webcam frames and streams JPEG buffers to /ws/video."""
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("[video] Error: Could not open webcam")
+    """Captures frames from RPi Camera v1.3 using Picamera2 and streams JPEG buffers."""
+    try:
+        picam2 = Picamera2()
+        config = picam2.create_video_configuration(main={"size": (640, 480), "format": "RGB888"})
+        picam2.configure(config)
+        picam2.start()
+        print("[video] RPi Camera v1.3 initialized via Picamera2")
+    except Exception as e:
+        print(f"[video] Fatal Camera Error: {e}")
         return
 
     interval = 1.0 / FRAME_SEND_HZ
 
-    while True:
-        uri = await get_server_uri("/ws/video")
-        if uri is None:
-            print("[video] Server not found via mDNS, retrying in 3s...")
-            await asyncio.sleep(3)
-            continue
+    try:
+        while True:
+            uri = await get_server_uri("/ws/video")
+            if uri is None:
+                print("[video] Server not found via mDNS, retrying in 3s...")
+                await asyncio.sleep(3)
+                continue
 
-        try:
-            print(f"[video] Connecting to {uri}...")
-            async with websockets.connect(uri, max_size=None) as ws:
-                print(f"[video] Connected to {uri}")
-                while True:
-                    ret, frame = cap.read()
-                    if not ret:
+            try:
+                print(f"[video] Connecting to {uri}...")
+                async with websockets.connect(uri, max_size=None) as ws:
+                    print(f"[video] Connected to {uri}")
+                    while True:
+                        frame_rgb = picam2.capture_array()
+                        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                        
+                        ok, buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                        if ok:
+                            await ws.send(buf.tobytes())
+
                         await asyncio.sleep(interval)
-                        continue
-
-                    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                    if ok:
-                        await ws.send(buf.tobytes())
-
-                    await asyncio.sleep(interval)
-        except (websockets.exceptions.ConnectionClosed, OSError) as e:
-            print(f"[video] Connection lost ({e}). Re-resolving server in 2.5s...")
-            await asyncio.sleep(2.5)
-        except Exception as e:
-            print(f"[video] Unexpected error: {e}")
-            await asyncio.sleep(2.5)
+            except (websockets.exceptions.ConnectionClosed, OSError) as e:
+                print(f"[video] Connection lost ({e}). Re-resolving server in 2.5s...")
+                await asyncio.sleep(2.5)
+            except Exception as e:
+                print(f"[video] Unexpected error: {e}")
+                await asyncio.sleep(2.5)
+    finally:
+        picam2.stop()
 
 
 async def receive_audio():
-    """Receives and plays raw PCM16 mono audio streams from /ws/audio."""
+    """Receives and plays raw PCM16 mono audio streams over 3.5mm AUX speaker."""
     while True:
         uri = await get_server_uri("/ws/audio")
         if uri is None:
@@ -124,6 +127,7 @@ async def receive_audio():
                     channels=CHANNELS,
                     dtype="int16",
                     blocksize=1024,
+                    device=AUDIO_OUTPUT_DEVICE,
                 ) as out_stream:
                     async for message in ws:
                         if isinstance(message, (bytes, bytearray)):
@@ -137,7 +141,7 @@ async def receive_audio():
 
 
 async def control_handler(hotkey_queue: asyncio.Queue):
-    """Handles control commands, detection toggles, and push-to-talk mic uploads."""
+    """Handles commands, detection toggles, and USB mic audio uploads."""
     mic_frames: list[np.ndarray] = []
     mic_stream: sd.InputStream | None = None
 
@@ -177,6 +181,7 @@ async def control_handler(hotkey_queue: asyncio.Queue):
                             channels=1,
                             dtype="int16",
                             callback=mic_callback,
+                            device=AUDIO_INPUT_DEVICE,
                         )
                         mic_stream.start()
                         print("[control] Listening...")
@@ -212,26 +217,24 @@ async def control_handler(hotkey_queue: asyncio.Queue):
             await asyncio.sleep(2.5)
 
 
-def start_keyboard_listener(loop: asyncio.AbstractEventLoop, hotkey_queue: asyncio.Queue) -> keyboard.Listener:
-    ptt_active = False
+def setup_gpio_buttons(loop: asyncio.AbstractEventLoop, hotkey_queue: asyncio.Queue) -> tuple[Button, Button]:
+    """Initializes hardware pushbuttons connected to GPIO pins."""
+    btn_toggle = Button(PIN_TOGGLE_DETECTION, pull_up=True, bounce_time=0.05)
+    btn_ptt = Button(PIN_PTT, pull_up=True, bounce_time=0.05)
 
-    def on_press(key):
-        nonlocal ptt_active
-        if key == keyboard.Key.f8:
-            asyncio.run_coroutine_threadsafe(hotkey_queue.put({"type": "toggle_detection"}), loop)
-        elif key == keyboard.Key.f9 and not ptt_active:
-            ptt_active = True
-            asyncio.run_coroutine_threadsafe(hotkey_queue.put({"type": "ptt_down"}), loop)
+    btn_toggle.when_pressed = lambda: asyncio.run_coroutine_threadsafe(
+        hotkey_queue.put({"type": "toggle_detection"}), loop
+    )
+    
+    btn_ptt.when_pressed = lambda: asyncio.run_coroutine_threadsafe(
+        hotkey_queue.put({"type": "ptt_down"}), loop
+    )
+    btn_ptt.when_released = lambda: asyncio.run_coroutine_threadsafe(
+        hotkey_queue.put({"type": "ptt_up"}), loop
+    )
 
-    def on_release(key):
-        nonlocal ptt_active
-        if key == keyboard.Key.f9:
-            ptt_active = False
-            asyncio.run_coroutine_threadsafe(hotkey_queue.put({"type": "ptt_up"}), loop)
-
-    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-    listener.start()
-    return listener
+    print(f"GPIO initialized: Pin {PIN_TOGGLE_DETECTION} (Toggle) | Pin {PIN_PTT} (Push-To-Talk)")
+    return btn_toggle, btn_ptt
 
 
 async def main():
@@ -243,8 +246,7 @@ async def main():
     loop = asyncio.get_running_loop()
     hotkey_queue: asyncio.Queue = asyncio.Queue()
 
-    listener = start_keyboard_listener(loop, hotkey_queue)
-    print("Hotkeys: F8 = toggle detection | Hold F9 = ask assistant\n")
+    btn_toggle, btn_ptt = setup_gpio_buttons(loop, hotkey_queue)
 
     try:
         await asyncio.gather(
@@ -253,7 +255,8 @@ async def main():
             control_handler(hotkey_queue),
         )
     finally:
-        listener.stop()
+        btn_toggle.close()
+        btn_ptt.close()
         zc.close()
 
 
